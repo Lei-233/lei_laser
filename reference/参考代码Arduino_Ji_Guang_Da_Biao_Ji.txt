@@ -1,0 +1,444 @@
+#include "GCodeParser.h"
+#include "DAC8562.h"
+#include <math.h>
+
+// ================= 硬件配置 =================
+#define REF_POWER 3.3383  // 参考电压值
+#define SS_PIN 10         // DAC8562 CS Pin
+#define LASER_PWM_PIN 9   // 激光 PWM Pin (Timer1)
+
+// ================= 振镜/坐标配置 =================
+// 警告：请根据实际振镜驱动板校准这些值
+// 通常振镜中心对应 DAC 中值 (32768)，这里假设 0-Vref 对应物理尺寸
+#define BEILV 100         // 脉冲当量：1mm 对应的 DAC 数值 (例如 100)
+#define DAC_MAX 65535     // DAC 最大值 (16-bit)
+#define STEP_NUM 0.1      // 插补最小距离 (mm)
+
+// ================= 缓冲区配置 =================
+#define RX_BUF_SIZE 256
+#define TX_BUF_SIZE 512
+
+DAC8562 dac = DAC8562(SS_PIN, REF_POWER);
+GCodeParser parser;
+
+// ================= 全局变量 =================
+// 串口缓冲
+volatile uint8_t rxBuf[RX_BUF_SIZE];
+volatile uint16_t rxHead = 0;
+volatile uint16_t rxTail = 0;
+volatile uint8_t txBuf[TX_BUF_SIZE];
+volatile uint16_t txHead = 0;
+volatile uint16_t txTail = 0;
+
+// 机器状态
+double currentX = 0.0;
+double currentY = 0.0;
+double currentFeedRate = 0.0;
+const double DEFAULT_FEED_RATE = 10000.0; // 默认速度 mm/min (注意原代码单位可能是 mm/min 或 mm/s，Grbl通常用 mm/min)
+const double G0_FEED_RATE = 20000.0;      // G0 空走速度
+
+// 激光控制
+bool laserEnabled = false;
+const double LASER_S_MAX = 1000.0;
+double currentSPower = 0.0;
+
+// 状态报告
+unsigned long lastStatusTime = 0;
+const unsigned long STATUS_INTERVAL = 200;
+volatile unsigned long lineCounter = 0;
+unsigned long lastActivityTime = 0;
+const unsigned long ACTIVITY_TIMEOUT = 200;
+
+// 模式
+bool isAbsoluteMode = true;
+
+// 辅助宏
+inline uint16_t rbNext(uint16_t idx, uint16_t size) {
+  return (uint16_t)((idx + 1) % size);
+}
+
+// ================= 函数声明 =================
+void processSerialInput();
+void processCommand(String line);
+void txFlushNonBlocking();
+void pollSerialToRxBuffer();
+void safeDelay(unsigned long ms); // 新增：安全延迟
+
+// ================= Setup =================
+void setup() {
+  dac.begin();
+  Serial.begin(115200);
+  parser.Initialize();
+  
+  delay(500); // 等待串口稳定
+
+  // 振镜回中 (假设 0 是原点)
+  dac.writeA(0);
+  dac.writeB(0);
+  
+  setupLaserPwm();
+
+  Serial.println("BlackDandelion LASER_V1.1_Fixed"); // 修改版本号
+  Serial.print("Grbl 1.1f ['$' for help]\r\n"); // 伪装成标准 Grbl 响应格式，利于软件识别
+}
+
+// ================= Loop =================
+void loop() {
+  processSerialInput();
+  sendPeriodicStatus();
+  txFlushNonBlocking();
+}
+
+// ================= 串口底层处理 (核心修复) =================
+
+void pollSerialToRxBuffer() {
+  while (Serial.available()) {
+    uint8_t c = (uint8_t)Serial.read();
+    uint16_t nextHead = rbNext(rxHead, RX_BUF_SIZE);
+    if (nextHead != rxTail) { // 仅当未满时存入，满则丢弃(防止溢出覆盖)
+      rxBuf[rxHead] = c;
+      rxHead = nextHead;
+    } else {
+      // 缓冲区满：这里可以选择记录错误或忽略，但绝不能移动 rxTail
+    }
+  }
+}
+
+bool tryDequeueLine(String &outLine) {
+  if (rxHead == rxTail) return false;
+  
+  // 预检是否有换行符
+  bool hasEol = false;
+  uint16_t tempHead = rxHead; // 使用快照，防止中断干扰(虽在此场景无中断修改Head)
+  uint16_t i = rxTail;
+  while (i != tempHead) {
+    if (rxBuf[i] == '\n' || rxBuf[i] == '\r') {
+      hasEol = true;
+      break;
+    }
+    i = rbNext(i, RX_BUF_SIZE);
+  }
+  if (!hasEol) return false;
+
+  outLine = "";
+  while (rxTail != rxHead) {
+    char c = (char)rxBuf[rxTail];
+    rxTail = rbNext(rxTail, RX_BUF_SIZE);
+    
+    if (c == '\n' || c == '\r') {
+      // 吞掉随后的换行符 (CRLF兼容)
+      while (rxTail != rxHead) {
+        char nextC = (char)rxBuf[rxTail];
+        if (nextC == '\n' || nextC == '\r') {
+          rxTail = rbNext(rxTail, RX_BUF_SIZE);
+        } else {
+          break;
+        }
+      }
+      return true; // 成功提取一行
+    } else {
+      if (outLine.length() < 80) { // 限制行长
+        outLine += c;
+      }
+    }
+  }
+  return false;
+}
+
+// TX 缓冲区 - 修复覆盖问题
+void txEnqueueChar(char c) {
+  uint16_t nextHead = rbNext(txHead, TX_BUF_SIZE);
+  
+  // 如果满，强制等待发送（阻塞式），保证数据完整性
+  while (nextHead == txTail) {
+    if (Serial.availableForWrite() > 0) {
+      Serial.write(txBuf[txTail]);
+      txTail = rbNext(txTail, TX_BUF_SIZE);
+    }
+    // 注意：这里死循环等待可能导致卡死，但比数据损坏好。
+    // 在主循环经常刷新 txFlushNonBlocking 的情况下通常不会触发。
+  }
+  
+  txBuf[txHead] = (uint8_t)c;
+  txHead = nextHead;
+}
+
+void txEnqueueStr(const char *s) {
+  while (*s) txEnqueueChar(*s++);
+}
+
+void txFlushNonBlocking() {
+  while (txHead != txTail) {
+    if (Serial.availableForWrite() > 0) {
+      Serial.write(txBuf[txTail]);
+      txTail = rbNext(txTail, TX_BUF_SIZE);
+    } else {
+      break;
+    }
+  }
+}
+
+// ================= 自定义非阻塞延迟 =================
+// 关键修复：在延迟期间必须搬运串口数据
+void safeDelay(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    pollSerialToRxBuffer(); // 保持接收数据
+    txFlushNonBlocking();   // 保持发送数据
+  }
+}
+
+// 精确微秒级延迟，同时处理串口
+void safeDelayMicros(unsigned long us) {
+  unsigned long start = micros();
+  while (micros() - start < us) {
+    if ((micros() - start) % 1000 == 0) { // 每1ms检查一次串口，避免太频繁
+       pollSerialToRxBuffer();
+    }
+  }
+}
+
+// ================= 运动控制与DAC =================
+
+// 将毫米转换为 DAC 值，包含安全限制
+uint16_t mmToDac(double mm) {
+  double val = mm * BEILV;
+  // 安全限制
+  if (val < 0) val = 0;
+  if (val > DAC_MAX) val = DAC_MAX;
+  return (uint16_t)val;
+}
+
+// 执行线性插补 (G0/G1)
+void performMove(double targetX, double targetY, double feedRateMmMin) {
+  double startX = currentX;
+  double startY = currentY;
+  double dx = targetX - startX;
+  double dy = targetY - startY;
+  double distance = sqrt(dx * dx + dy * dy);
+
+  if (distance < STEP_NUM) {
+    currentX = targetX;
+    currentY = targetY;
+    dac.outPutValue(0x18, mmToDac(currentX));
+    dac.outPutValue(0x19, mmToDac(currentY));
+    return;
+  }
+
+  // 速度 mm/min -> mm/sec
+  double feedRateSec = feedRateMmMin / 60.0;
+  if (feedRateSec < 0.1) feedRateSec = 0.1; // 防止除零
+
+  // 计算步数
+  int steps = (int)(distance / STEP_NUM);
+  if (steps < 1) steps = 1;
+
+  double stepDx = dx / steps;
+  double stepDy = dy / steps;
+  
+  // 计算每步时间 (微秒)
+  // 时间 = 距离 / 速度
+  double totalTimeSec = distance / feedRateSec;
+  double stepTimeUs = (totalTimeSec * 1000000.0) / steps;
+  
+  // 限制最小时间，取决于 DAC 响应速度
+  if (stepTimeUs < 20) stepTimeUs = 20; 
+
+  for (int i = 1; i <= steps; i++) {
+    currentX += stepDx;
+    currentY += stepDy;
+    
+    // 更新 DAC
+    dac.outPutValue(0x18, mmToDac(currentX));
+    dac.outPutValue(0x19, mmToDac(currentY));
+    
+    // 非阻塞延迟
+    unsigned long startUs = micros();
+    while (micros() - startUs < (unsigned long)stepTimeUs) {
+       // 极其重要的调用：在移动过程中接收数据
+       pollSerialToRxBuffer(); 
+    }
+  }
+
+  // 修正最终位置
+  currentX = targetX;
+  currentY = targetY;
+  dac.outPutValue(0x18, mmToDac(currentX));
+  dac.outPutValue(0x19, mmToDac(currentY));
+}
+
+
+// ================= 命令处理逻辑 =================
+
+void processSerialInput() {
+  pollSerialToRxBuffer();
+  String line;
+  while (tryDequeueLine(line)) {
+    processCommand(line);
+  }
+}
+
+void processCommand(String line) {
+  line.trim();
+  if (line.length() == 0) return;
+
+  // 实时命令
+  if (line == "?") {
+    sendStatusReport();
+    return; // ? 命令通常不回复 ok，也不进解析器
+  }
+
+  if (line.startsWith("$")) {
+    processGrblCommand(line);
+    return;
+  }
+
+  processGCode(line);
+}
+
+void processGrblCommand(String cmd) {
+  if (cmd == "$I") {
+    Serial.println("[VER:1.1f.20230101:]");
+    Serial.println("[OPT:V,15,128]");
+    txEnqueueStr("ok\n");
+  } else if (cmd == "$G") {
+    // 报告当前的 G 代码模态
+    String report = "[GC:G0 G54 G17 G21 G90 G94 M5 T0 F";
+    report += String((long)currentFeedRate);
+    report += " S";
+    report += String((long)currentSPower);
+    report += "]\r\n";
+    // 注意：这里需要分段发送或者确保 txEnqueueStr 能处理 String
+    char buf[64];
+    report.toCharArray(buf, 64);
+    txEnqueueStr(buf);
+    txEnqueueStr("ok\n");
+  } else {
+    txEnqueueStr("ok\n"); // 对未知 $ 命令假装成功，防止软件卡死
+  }
+}
+
+void processGCode(String line) {
+  parser.Initialize();
+  for (size_t i = 0; i < line.length(); i++) {
+    char c = line.charAt(i);
+    if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+    parser.AddCharToLine(c);
+  }
+  parser.ParseLine();
+
+  bool motionValuesChanged = false;
+
+  // 1. 提取 F (速度)
+  if (parser.HasWord('F')) {
+    currentFeedRate = parser.GetWordValue('F');
+  }
+
+  // 2. 提取 S (功率) 并立即执行
+  if (parser.HasWord('S')) {
+    double s = parser.GetWordValue('S');
+    if (s < 0) s = 0;
+    if (s > LASER_S_MAX) s = LASER_S_MAX;
+    currentSPower = s;
+    if (laserEnabled) setLaserDutyByS(currentSPower);
+  }
+
+  // 3. 处理 M 命令
+  if (parser.HasWord('M')) {
+    int mVal = (int)parser.GetWordValue('M');
+    if (mVal == 3 || mVal == 4) {
+      laserEnabled = true;
+      setLaserDutyByS(currentSPower);
+    } else if (mVal == 5) {
+      laserEnabled = false;
+      setLaserDutyByS(0);
+    }
+  }
+
+  // 4. 处理 G 命令
+  if (parser.HasWord('G')) {
+    int gVal = (int)parser.GetWordValue('G');
+    
+    // G90/G91
+    if (gVal == 90) isAbsoluteMode = true;
+    else if (gVal == 91) isAbsoluteMode = false;
+    else if (gVal == 92) { currentX = 0; currentY = 0; dac.writeA(0); dac.writeB(0); }
+    
+    // 运动命令 G0, G1
+    else if (gVal == 0 || gVal == 1) {
+      double targetX = currentX;
+      double targetY = currentY;
+      bool hasMove = false;
+
+      if (parser.HasWord('X')) {
+        double val = parser.GetWordValue('X');
+        targetX = isAbsoluteMode ? val : (currentX + val);
+        hasMove = true;
+      }
+      if (parser.HasWord('Y')) {
+        double val = parser.GetWordValue('Y');
+        targetY = isAbsoluteMode ? val : (currentY + val);
+        hasMove = true;
+      }
+
+      if (hasMove) {
+        double speed = (gVal == 0) ? G0_FEED_RATE : currentFeedRate;
+        if (speed <= 0) speed = DEFAULT_FEED_RATE;
+        
+        // 执行非阻塞移动
+        performMove(targetX, targetY, speed);
+      }
+    }
+  }
+
+  // 完成指令，发送 ok
+  lineCounter++;
+  lastActivityTime = millis();
+  txEnqueueStr("ok\n");
+}
+
+void sendStatusReport() {
+  // 格式: <Idle|MPos:0.000,0.000,0.000|FS:0,0>
+  char buf[100];
+  const char *state = (millis() - lastActivityTime < ACTIVITY_TIMEOUT) ? "Run" : "Idle";
+  
+  // 使用 dtostrf 格式化浮点数 (Arduino不支持printf浮点)
+  char xStr[10], yStr[10];
+  dtostrf(currentX, 1, 3, xStr);
+  dtostrf(currentY, 1, 3, yStr);
+  
+  snprintf(buf, sizeof(buf), "<%s|MPos:%s,%s,0.000|FS:%ld,%d>\r\n", 
+           state, xStr, yStr, (long)currentFeedRate, (int)currentSPower);
+           
+  txEnqueueStr(buf); // 修复：原代码缺失这行
+}
+
+void sendPeriodicStatus() {
+  if (millis() - lastStatusTime >= STATUS_INTERVAL) {
+    lastStatusTime = millis();
+    // 只有在空闲或有状态请求时才主动发送，避免阻塞
+    // 此处可根据需要开启，LaserGRBL 依赖 "?", 而非自动上报
+    // sendStatusReport(); 
+  }
+}
+
+// ================= PWM 控制 =================
+
+void setupLaserPwm() {
+  pinMode(LASER_PWM_PIN, OUTPUT);
+  TCCR1A = 0; TCCR1B = 0; TCNT1 = 0;
+  
+  // Fast PWM, Mode 14 (ICR1 as TOP)
+  TCCR1A = (1 << WGM11) | (1 << COM1A1);
+  TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS11); // Prescaler 8
+  
+  ICR1 = 1999; // 16MHz / (8 * (1999+1)) = 1kHz
+  OCR1A = 0;
+}
+
+void setLaserDutyByS(double s) {
+  if (s < 0) s = 0;
+  if (s > LASER_S_MAX) s = LASER_S_MAX;
+  uint16_t duty = (uint16_t)((s / LASER_S_MAX) * 1999);
+  OCR1A = duty;
+}

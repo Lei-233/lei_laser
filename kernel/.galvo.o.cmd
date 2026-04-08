@@ -1,0 +1,1 @@
+cmd_/home/lei/lei_laser_back/kernel/galvo.o := /home/lei/tspi_linux_sdk/prebuilts/gcc/linux-x86/aarch64/gcc-linaro-6.3.1-2017.05-x86_64_aarch64-linux-gnu/bin/aarch64-linux-gnu-ld -EL  -maarch64elf   -r -o /home/lei/lei_laser_back/kernel/galvo.o /home/lei/lei_laser_back/kernel/galvo_drv.o /home/lei/lei_laser_back/kernel/galvo_ioctl.o 
