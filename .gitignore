@@ -11,6 +11,7 @@ user/build/*
 *.so
 *.elf
 *.bin
+*.idx
 .omc/
 
 # Linux 内核模块 (.ko) 编译产物

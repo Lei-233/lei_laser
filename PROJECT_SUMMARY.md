@@ -49,10 +49,9 @@
 | SPI模式 | Mode 1 (CPOL=0, CPHA=1) |
 | 精度 | 65536级 (0-65535, 对应0-5V) |
 | 设备节点 | /dev/galvo |
-| ioctl | SET_AB, HOME, ENABLE, SET_BATCH (hrtimer异步批处理) |
-| 高级特性 | 使用 hrtimer + spi_async 实现微秒级无抖动坐标输出 |
+| ioctl | SET_AB, HOME, ENABLE |
 | 测试模式 | 正方形扫描、圆形扫描 |
-| 状态 | 已完成 |
+| 状态 | 开发中 |
 
 ### 3. 串口通信模块 (计划中)
 

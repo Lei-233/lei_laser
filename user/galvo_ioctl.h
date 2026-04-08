@@ -1,18 +1,23 @@
-// pwm_laser_ioctl.h
+// user/galvo_ioctl.h
 #ifndef _GALVO_IOCTL_H_
 #define _GALVO_IOCTL_H_
 
 #include <sys/ioctl.h>
 #include <stdint.h>
 
-struct galvo_ab {
-    uint16_t a;
-    uint16_t b;
+struct galvo_point {
+    uint16_t x;
+    uint16_t y;
+    uint16_t pwm_duty;
+    uint32_t delay_us;
+};
+
+struct galvo_batch {
+    struct galvo_point *points;
+    uint32_t count;
 };
 
 #define GALVO_IOC_MAGIC 'g'
-#define GALVO_IOC_SET_AB  _IOW(GALVO_IOC_MAGIC, 1, struct galvo_ab)
-#define GALVO_IOC_HOME    _IO(GALVO_IOC_MAGIC, 2)
-#define GALVO_IOC_ENABLE _IOW(GALVO_IOC_MAGIC, 3, int)
+#define GALVO_IOC_SET_BATCH _IOW(GALVO_IOC_MAGIC, 4, struct galvo_batch)
 
 #endif
