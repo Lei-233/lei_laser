@@ -23,3 +23,18 @@ modules.order
 Module.symvers
 .*.cmd
 .tmp_versions/
+
+# 其他缓存与工具配置文件
+.cache/
+.claude/
+
+# Qt 编译生成的 moc 文件
+moc_*.cpp
+moc_*.h
+moc_*.o
+ui_*.h
+
+# User 目录下的无后缀可执行程序
+user/galvo_app
+user/pwm_app
+user/uart_controller

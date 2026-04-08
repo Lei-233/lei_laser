@@ -10,12 +10,13 @@ project(laser_3 C)
 # 编译选项
 add_compile_options(-Wall -O2)
 
-
+# ---------- pwm_app ----------
+add_executable(pwm_app pwm_app.c pwm_laser_hal.c)
 
 # ---------- galvo_app ----------
 add_executable(galvo_app galvo_app.c galvo_hal.c)
 target_link_libraries(galvo_app m)
 
 # ---------- uart_controller ----------
-add_executable(uart_controller uart_controller.c galvo_hal.c)
+add_executable(uart_controller uart_controller.c galvo_hal.c pwm_laser_hal.c)
 target_link_libraries(uart_controller m)
