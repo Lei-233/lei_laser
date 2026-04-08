@@ -1,0 +1,24 @@
+# CMake / 编译构建目录
+build/
+user/build/
+
+# VS Code 配置与缓存
+.vscode/
+
+# Linux C/C++ 常见编译产物
+*.o
+*.a
+*.so
+*.elf
+*.bin
+.omc/
+
+# Linux 内核模块 (.ko) 编译产物
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+modules.order
+Module.symvers
+.*.cmd
+.tmp_versions/
