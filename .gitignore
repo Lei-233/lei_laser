@@ -1,6 +1,6 @@
 # CMake / 编译构建目录
 build/
-user/build/
+user/build/*
 
 # VS Code 配置与缓存
 .vscode/
