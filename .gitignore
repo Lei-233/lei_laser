@@ -23,3 +23,7 @@ modules.order
 Module.symvers
 .*.cmd
 .tmp_versions/
+
+
+# 其它
+.claude/
